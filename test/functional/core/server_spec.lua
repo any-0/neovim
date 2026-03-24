@@ -2,9 +2,10 @@ local t = require('test.testutil')
 local n = require('test.functional.testnvim')()
 
 local eq, neq, eval = t.eq, t.neq, n.eval
-local clear, fn, api = n.clear, n.fn, n.api
+local clear, command, fn, api, exec_lua = n.clear, n.command, n.fn, n.api, n.exec_lua
 local matches = t.matches
 local pcall_err = t.pcall_err
+local retry = t.retry
 local check_close = n.check_close
 local mkdir = t.mkdir
 local rmdir = n.rmdir
@@ -219,7 +220,431 @@ describe('server', function()
     client:close()
   end)
 
-  it('removes stale socket files automatically #26053', function()
+  it('connect() selects a peer server', function()
+    t.skip(is_os('win'), 'N/A on Windows')
+
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    local tmp_dir2 = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    finally(function()
+      fn.delete(tmp_dir, 'rf')
+      fn.delete(tmp_dir2, 'rf')
+    end)
+    clear({ env = { XDG_RUNTIME_DIR = tmp_dir } })
+
+    local peer_temp = n.new_pipename()
+    local peer_name = peer_temp:match('[^/]*$')
+    local peer_addr = ('%s/%s'):format(tmp_dir2, peer_name)
+    local peer = n.new_session(true, {
+      args = { '--clean', '--listen', peer_addr, '--embed' },
+      env = { XDG_RUNTIME_DIR = tmp_dir2 },
+      merge = false,
+    })
+    retry(nil, nil, function()
+      eq(true, vim.list_contains(fn.serverlist({ peer = true }), peer_addr))
+    end)
+
+    local rv = exec_lua(([[
+      package.loaded['vim._core.server'] = nil
+      require('vim._core.server')
+      local selected
+      local invoked
+      local schedule = vim.schedule
+      local select = vim.ui.select
+      local nvim_cmd = vim.api.nvim_cmd
+
+      vim.schedule = function(cb)
+        cb()
+      end
+      vim.ui.select = function(items, _, on_choice)
+        selected = items
+        on_choice(%q, 1)
+      end
+      vim.api.nvim_cmd = function(cmd, _)
+        invoked = cmd
+      end
+
+      local ok = require('vim._core.server').connect(false)
+
+      vim.schedule = schedule
+      vim.ui.select = select
+      vim.api.nvim_cmd = nvim_cmd
+
+      return { ok, selected, invoked }
+    ]]):format(peer_addr))
+    eq({ true, { peer_addr }, { cmd = 'connect', bang = false, args = { peer_addr }, mods = {} } }, rv)
+
+    peer:close()
+  end)
+
+  it('connect() ignores local aliases', function()
+    t.skip(is_os('win'), 'N/A on Windows')
+
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    local tmp_dir2 = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    finally(function()
+      fn.delete(tmp_dir, 'rf')
+      fn.delete(tmp_dir2, 'rf')
+    end)
+    clear({ env = { XDG_RUNTIME_DIR = tmp_dir } })
+
+    local alias = tmp_dir .. '/nvim.alias'
+    eq(alias, fn.serverstart(alias))
+
+    local peer_temp = n.new_pipename()
+    local peer_name = peer_temp:match('[^/]*$')
+    local peer_addr = ('%s/%s'):format(tmp_dir2, peer_name)
+    local peer = n.new_session(true, {
+      args = { '--clean', '--listen', peer_addr, '--embed' },
+      env = { XDG_RUNTIME_DIR = tmp_dir2 },
+      merge = false,
+    })
+    retry(nil, nil, function()
+      local peers = fn.serverlist({ peer = true })
+      eq(true, vim.list_contains(peers, alias))
+      eq(true, vim.list_contains(peers, peer_addr))
+    end)
+
+    local rv = exec_lua(([[
+      package.loaded['vim._core.server'] = nil
+      require('vim._core.server')
+      local selected
+      local schedule = vim.schedule
+      local select = vim.ui.select
+
+      vim.schedule = function(cb)
+        cb()
+      end
+      vim.ui.select = function(items, _, on_choice)
+        selected = items
+        on_choice(nil, nil)
+      end
+
+      local ok = require('vim._core.server').connect(false)
+
+      vim.schedule = schedule
+      vim.ui.select = select
+
+      return { ok, selected }
+    ]]))
+    eq({ true, { peer_addr } }, rv)
+
+    eq(1, fn.serverstop(alias))
+    peer:close()
+  end)
+
+  it('connect() returns false when no peer servers are found', function()
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    finally(function()
+      fn.delete(tmp_dir, 'rf')
+    end)
+    clear({ env = { XDG_RUNTIME_DIR = tmp_dir } })
+
+    local rv = exec_lua([[
+      package.loaded['vim._core.server'] = nil
+      require('vim._core.server')
+      return require('vim._core.server').connect(false)
+    ]])
+    eq(false, rv)
+  end)
+
+  it('connect() fails fast without a UI', function()
+    clear()
+
+    exec_lua([[
+      _G.serverlist = vim.fn.serverlist
+      vim.fn.serverlist = function(opts)
+        if opts and opts.peer then
+          return { '/tmp/nvim.peer' }
+        end
+        return {}
+      end
+    ]])
+    matches('Vim%(connect%):E5769: :connect without an address requires a UI', pcall_err(command, 'connect'))
+    exec_lua([[
+      vim.fn.serverlist = _G.serverlist
+      _G.serverlist = nil
+    ]])
+  end)
+
+  it('connect() preserves bang', function()
+    t.skip(is_os('win'), 'N/A on Windows')
+
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    local tmp_dir2 = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    finally(function()
+      fn.delete(tmp_dir, 'rf')
+      fn.delete(tmp_dir2, 'rf')
+    end)
+    clear({ env = { XDG_RUNTIME_DIR = tmp_dir } })
+
+    local peer_temp = n.new_pipename()
+    local peer_name = peer_temp:match('[^/]*$')
+    local peer_addr = ('%s/%s'):format(tmp_dir2, peer_name)
+    local peer = n.new_session(true, {
+      args = { '--clean', '--listen', peer_addr, '--embed' },
+      env = { XDG_RUNTIME_DIR = tmp_dir2 },
+      merge = false,
+    })
+    retry(nil, nil, function()
+      eq(true, vim.list_contains(fn.serverlist({ peer = true }), peer_addr))
+    end)
+
+    local rv = exec_lua(([[
+      package.loaded['vim._core.server'] = nil
+      require('vim._core.server')
+      local selected
+      local invoked
+      local schedule = vim.schedule
+      local select = vim.ui.select
+      local nvim_cmd = vim.api.nvim_cmd
+
+      vim.schedule = function(cb)
+        cb()
+      end
+      vim.ui.select = function(items, _, on_choice)
+        selected = items
+        on_choice(%q, 1)
+      end
+      vim.api.nvim_cmd = function(cmd, _)
+        invoked = cmd
+      end
+
+      local ok = require('vim._core.server').connect(true)
+
+      vim.schedule = schedule
+      vim.ui.select = select
+      vim.api.nvim_cmd = nvim_cmd
+
+      return { ok, selected, invoked }
+    ]]):format(peer_addr))
+    eq({ true, { peer_addr }, { cmd = 'connect', bang = true, args = { peer_addr }, mods = {} } }, rv)
+
+    peer:close()
+  end)
+
+  it('connect() suppresses async follow-up errors when emsg_silent is set', function()
+    clear()
+    local rv = exec_lua([[
+      package.loaded['vim._core.server'] = nil
+      require('vim._core.server')
+      local written
+      local schedule = vim.schedule
+      local select = vim.ui.select
+      local nvim_cmd = vim.api.nvim_cmd
+      local err_writeln = vim.api.nvim_err_writeln
+      local list_uis = vim.api.nvim_list_uis
+      local serverlist = vim.fn.serverlist
+
+      vim.fn.serverlist = function(opts)
+        if opts and opts.peer then
+          return { '/tmp/nvim.peer' }
+        end
+        return {}
+      end
+      vim.api.nvim_list_uis = function()
+        return { { chan = 1 } }
+      end
+      vim.schedule = function(cb)
+        cb()
+      end
+      vim.ui.select = function(_, _, on_choice)
+        on_choice('/tmp/nvim.peer', 1)
+      end
+      vim.api.nvim_cmd = function()
+        error('boom\n')
+      end
+      vim.api.nvim_err_writeln = function(msg)
+        written = msg
+      end
+
+      local ok = require('vim._core.server').connect(false, { emsg_silent = true })
+
+      vim.fn.serverlist = serverlist
+      vim.api.nvim_list_uis = list_uis
+      vim.schedule = schedule
+      vim.ui.select = select
+      vim.api.nvim_cmd = nvim_cmd
+      vim.api.nvim_err_writeln = err_writeln
+
+      return { ok, written }
+    ]])
+    eq({ true, nil }, rv)
+  end)
+
+  it('connect() reports async follow-up errors when only silent is set', function()
+    clear()
+    local rv = exec_lua([[
+      package.loaded['vim._core.server'] = nil
+      require('vim._core.server')
+      local written
+      local schedule = vim.schedule
+      local select = vim.ui.select
+      local nvim_cmd = vim.api.nvim_cmd
+      local err_writeln = vim.api.nvim_err_writeln
+      local list_uis = vim.api.nvim_list_uis
+      local serverlist = vim.fn.serverlist
+
+      vim.fn.serverlist = function(opts)
+        if opts and opts.peer then
+          return { '/tmp/nvim.peer' }
+        end
+        return {}
+      end
+      vim.api.nvim_list_uis = function()
+        return { { chan = 1 } }
+      end
+      vim.schedule = function(cb)
+        cb()
+      end
+      vim.ui.select = function(_, _, on_choice)
+        on_choice('/tmp/nvim.peer', 1)
+      end
+      vim.api.nvim_cmd = function()
+        error('boom\n')
+      end
+      vim.api.nvim_err_writeln = function(msg)
+        written = msg
+      end
+
+      local ok = require('vim._core.server').connect(false, { silent = true })
+
+      vim.fn.serverlist = serverlist
+      vim.api.nvim_list_uis = list_uis
+      vim.schedule = schedule
+      vim.ui.select = select
+      vim.api.nvim_cmd = nvim_cmd
+      vim.api.nvim_err_writeln = err_writeln
+
+      return { ok, written }
+    ]])
+    matches('boom$', rv[2])
+    eq(true, rv[1])
+  end)
+
+  it('connect() can be cancelled', function()
+    t.skip(is_os('win'), 'N/A on Windows')
+
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    local tmp_dir2 = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    finally(function()
+      fn.delete(tmp_dir, 'rf')
+      fn.delete(tmp_dir2, 'rf')
+    end)
+    clear({ env = { XDG_RUNTIME_DIR = tmp_dir } })
+
+    local peer_temp = n.new_pipename()
+    local peer_name = peer_temp:match('[^/]*$')
+    local peer_addr = ('%s/%s'):format(tmp_dir2, peer_name)
+    local peer = n.new_session(true, {
+      args = { '--clean', '--listen', peer_addr, '--embed' },
+      env = { XDG_RUNTIME_DIR = tmp_dir2 },
+      merge = false,
+    })
+    retry(nil, nil, function()
+      eq(true, vim.list_contains(fn.serverlist({ peer = true }), peer_addr))
+    end)
+
+    local rv = exec_lua(([[
+      package.loaded['vim._core.server'] = nil
+      require('vim._core.server')
+      local selected
+      local invoked
+      local schedule = vim.schedule
+      local select = vim.ui.select
+      local nvim_cmd = vim.api.nvim_cmd
+
+      vim.schedule = function(cb)
+        cb()
+      end
+      vim.ui.select = function(items, _, on_choice)
+        selected = items
+        on_choice(nil, nil)
+      end
+      vim.api.nvim_cmd = function(cmd, _)
+        invoked = cmd
+      end
+
+      local ok = require('vim._core.server').connect(true)
+
+      vim.schedule = schedule
+      vim.ui.select = select
+      vim.api.nvim_cmd = nvim_cmd
+
+      return { ok, selected, invoked }
+    ]]):format(peer_addr))
+    eq({ true, { peer_addr } }, rv)
+
+    peer:close()
+  end)
+
+  it('connect() preserves command modifiers', function()
+    t.skip(is_os('win'), 'N/A on Windows')
+
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    local tmp_dir2 = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    finally(function()
+      fn.delete(tmp_dir, 'rf')
+      fn.delete(tmp_dir2, 'rf')
+    end)
+    clear({ env = { XDG_RUNTIME_DIR = tmp_dir } })
+
+    local peer_temp = n.new_pipename()
+    local peer_name = peer_temp:match('[^/]*$')
+    local peer_addr = ('%s/%s'):format(tmp_dir2, peer_name)
+    local peer = n.new_session(true, {
+      args = { '--clean', '--listen', peer_addr, '--embed' },
+      env = { XDG_RUNTIME_DIR = tmp_dir2 },
+      merge = false,
+    })
+    retry(nil, nil, function()
+      eq(true, vim.list_contains(fn.serverlist({ peer = true }), peer_addr))
+    end)
+
+    local rv = exec_lua(([[
+      package.loaded['vim._core.server'] = nil
+      local invoked
+      local schedule = vim.schedule
+      local select = vim.ui.select
+      local nvim_cmd = vim.api.nvim_cmd
+      local list_uis = vim.api.nvim_list_uis
+
+      vim.api.nvim_list_uis = function()
+        return { { chan = 1 } }
+      end
+      vim.schedule = function(cb)
+        cb()
+      end
+      vim.ui.select = function(_, _, on_choice)
+        on_choice(%q, 1)
+      end
+      vim.api.nvim_cmd = function(cmd, _)
+        invoked = cmd
+      end
+
+      vim.cmd('tabnew')
+      vim.cmd('2tab silent confirm keepalt aboveleft botright vertical connect')
+
+      vim.schedule = schedule
+      vim.ui.select = select
+      vim.api.nvim_cmd = nvim_cmd
+      vim.api.nvim_list_uis = list_uis
+
+      return invoked
+    ]]):format(peer_addr))
+    eq('connect', rv.cmd)
+    eq(false, rv.bang)
+    eq({ peer_addr }, rv.args)
+    eq(true, rv.mods.confirm)
+    eq(true, rv.mods.keepalt)
+    eq(true, rv.mods.silent)
+    eq('botright', rv.mods.split)
+    eq(2, rv.mods.tab)
+    eq(true, rv.mods.vertical)
+
+    peer:close()
+  end)
+
+  it('removes stale socket files automatically #36581', function()
     -- Windows named pipes are ephemeral kernel objects that are automatically
     -- cleaned up when the process terminates. Unix domain sockets persist as
     -- files on the filesystem and can become stale after crashes.

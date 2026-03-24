@@ -27,6 +27,7 @@
 #include "nvim/channel.h"
 #include "nvim/charset.h"
 #include "nvim/clipboard.h"
+#include "nvim/cmdmods.h"
 #include "nvim/cmdexpand.h"
 #include "nvim/cmdexpand_defs.h"
 #include "nvim/cursor.h"
@@ -5815,10 +5816,33 @@ static void ex_detach(exarg_T *eap)
 ///
 /// Connects the current UI to a different server
 ///
-/// ":connect <address>" detaches the current UI and connects to the given server.
-/// ":connect! <address>" stops the current server if no other UIs are attached, then connects to the given server.
+/// ":connect [address]" detaches the current UI and connects to the given server.
+/// If [address] is omitted, a picker is shown for other known servers.
+/// ":connect! [address]" stops the current server if no other UIs are attached, then
+/// connects to the given server.
 static void ex_connect(exarg_T *eap)
 {
+  if (*eap->arg == NUL) {
+    Arena arena = ARENA_EMPTY;
+    MAXSIZE_TEMP_ARRAY(args, 2);
+    ADD_C(args, BOOLEAN_OBJ(eap->forceit));
+    ADD_C(args, DICT_OBJ(cmdmods_dict(&cmdmod, &arena)));
+
+    Error err = ERROR_INIT;
+    Object rv = NLUA_EXEC_STATIC("return require('vim._core.server').connect(...)",
+                                 args, kRetObject, &arena, &err);
+    if (ERROR_SET(&err)) {
+      emsg(err.msg);
+      api_clear_error(&err);
+    } else if (rv.type == kObjectTypeBoolean && !rv.data.boolean) {
+      emsg(_(e_no_other_servers_found));
+    } else if (rv.type == kObjectTypeString && strequal(rv.data.string.data, "no_ui")) {
+      emsg(_(e_connect_requires_ui));
+    }
+    arena_mem_free(arena_finish(&arena));
+    return;
+  }
+
   bool stop_server = eap->forceit ? (ui_active() == 1) : false;
 
   Error err = ERROR_INIT;

@@ -470,18 +470,47 @@ describe('TUI :connect', function()
                                                       |
   ]]
 
-  it('leaves the current server running', function()
+  it('reports when no other servers are available', function()
     n.clear()
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
     finally(function()
+      fn.delete(tmp_dir, 'rf')
       n.check_close()
     end)
 
-    local server1 = new_pipename()
-    local screen1 = tt.setup_child_nvim({ '--listen', server1, '--clean' })
+    local server1 = tmp_dir .. '/nvim.server1'
+    local screen1 = tt.setup_child_nvim({ '--listen', server1, '--clean' }, {
+      env = { XDG_RUNTIME_DIR = tmp_dir },
+    })
     screen1:expect({ any = vim.pesc('[No Name]') })
 
     tt.feed_data(':connect\013')
-    screen1:expect({ any = 'E471: Argument required' })
+    screen1:expect({ any = 'E5768: No other servers found' })
+
+    local server1_session = n.connect(server1)
+    server1_session:request('nvim_command', 'qall!')
+    screen1:expect({ any = vim.pesc('[Process exited 0]') })
+
+    screen1:detach()
+  end)
+
+  it('uses the picker for :connect with no arguments', function()
+    if t.skip(is_os('win'), 'peer server discovery is not supported on Windows') then
+      return
+    end
+
+    n.clear()
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    finally(function()
+      fn.delete(tmp_dir, 'rf')
+      n.check_close()
+    end)
+
+    local server1 = tmp_dir .. '/nvim.server1'
+    local screen1 = tt.setup_child_nvim({ '--listen', server1, '--clean' }, {
+      env = { XDG_RUNTIME_DIR = tmp_dir },
+    })
+    screen1:expect({ any = vim.pesc('[No Name]') })
 
     tt.feed_data('iThis is server 1.\027')
     screen1:expect({ any = vim.pesc('This is server 1^.') })
@@ -491,8 +520,65 @@ describe('TUI :connect', function()
     screen1:expect(screen_empty)
     screen1:detach()
 
-    local server2 = new_pipename()
-    local screen2 = tt.setup_child_nvim({ '--listen', server2, '--clean' })
+    local server2 = tmp_dir .. '/nvim.server2'
+    local screen2 = tt.setup_child_nvim({
+      '--listen',
+      server2,
+      '--clean',
+      '--cmd',
+      'lua vim.ui.select = function(items, _, cb) cb(items[1]) end',
+    }, {
+      env = { XDG_RUNTIME_DIR = tmp_dir },
+    })
+    screen2:expect({ any = vim.pesc('[No Name]') })
+
+    tt.feed_data('iThis is server 2.\027')
+    screen2:expect({ any = vim.pesc('This is server 2^.') })
+
+    tt.feed_data(':connect\013')
+    screen2:expect({ any = vim.pesc('This is server 1^.') })
+
+    local server1_session = n.connect(server1)
+    server1_session:request('nvim_command', 'qall!')
+    screen2:expect({ any = vim.pesc('[Process exited 0]') })
+
+    screen2:detach()
+
+    local server2_session = n.connect(server2)
+
+    local screen3 = tt.setup_child_nvim({ '--remote-ui', '--server', server2 })
+    screen3:expect({ any = vim.pesc('This is server 2^.') })
+
+    screen3:detach()
+    server2_session:request('nvim_command', 'qall!')
+  end)
+
+  it('leaves the current server running', function()
+    n.clear()
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    finally(function()
+      fn.delete(tmp_dir, 'rf')
+      n.check_close()
+    end)
+
+    local server1 = tmp_dir .. '/nvim.server1'
+    local screen1 = tt.setup_child_nvim({ '--listen', server1, '--clean' }, {
+      env = { XDG_RUNTIME_DIR = tmp_dir },
+    })
+    screen1:expect({ any = vim.pesc('[No Name]') })
+
+    tt.feed_data('iThis is server 1.\027')
+    screen1:expect({ any = vim.pesc('This is server 1^.') })
+
+    -- Prevent screen2 from receiving the old terminal state.
+    command('enew')
+    screen1:expect(screen_empty)
+    screen1:detach()
+
+    local server2 = tmp_dir .. '/nvim.server2'
+    local screen2 = tt.setup_child_nvim({ '--listen', server2, '--clean' }, {
+      env = { XDG_RUNTIME_DIR = tmp_dir },
+    })
     screen2:expect({ any = vim.pesc('[No Name]') })
 
     tt.feed_data('iThis is server 2.\027')
@@ -518,12 +604,16 @@ describe('TUI :connect', function()
 
   it('! stops the current server', function()
     n.clear()
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
     finally(function()
+      fn.delete(tmp_dir, 'rf')
       n.check_close()
     end)
 
     local server1 = new_pipename()
-    local screen1 = tt.setup_child_nvim({ '--listen', server1, '--clean' })
+    local screen1 = tt.setup_child_nvim({ '--listen', server1, '--clean' }, {
+      env = { XDG_RUNTIME_DIR = tmp_dir },
+    })
     screen1:expect({ any = vim.pesc('[No Name]') })
 
     tt.feed_data('iThis is server 1.\027')
@@ -535,10 +625,67 @@ describe('TUI :connect', function()
     screen1:detach()
 
     local server2 = new_pipename()
-    local screen2 = tt.setup_child_nvim({ '--listen', server2, '--clean' })
+    local screen2 = tt.setup_child_nvim({ '--listen', server2, '--clean' }, {
+      env = { XDG_RUNTIME_DIR = tmp_dir },
+    })
     screen2:expect({ any = vim.pesc('[No Name]') })
 
     tt.feed_data(':connect! ' .. server1 .. '\013')
+    screen2:expect({ any = vim.pesc('This is server 1^.') })
+
+    retry(nil, nil, function()
+      eq(nil, vim.uv.fs_stat(server2))
+    end)
+
+    local server1_session = n.connect(server1)
+    server1_session:request('nvim_command', 'qall!')
+    screen2:expect({ any = vim.pesc('[Process exited 0]') })
+
+    screen2:detach()
+  end)
+
+  it('uses the picker for :connect! with no arguments', function()
+    if t.skip(is_os('win'), 'peer server discovery is not supported on Windows') then
+      return
+    end
+
+    n.clear()
+    local tmp_dir = assert(vim.uv.fs_mkdtemp(vim.fs.dirname(t.tmpname(false)) .. '/XXXXXX'))
+    finally(function()
+      fn.delete(tmp_dir, 'rf')
+      n.check_close()
+    end)
+
+    local server1 = tmp_dir .. '/nvim.server1'
+    local screen1 = tt.setup_child_nvim({ '--listen', server1, '--clean' }, {
+      env = { XDG_RUNTIME_DIR = tmp_dir },
+    })
+    screen1:expect({ any = vim.pesc('[No Name]') })
+
+    tt.feed_data('iThis is server 1.\027')
+    screen1:expect({ any = vim.pesc('This is server 1^.') })
+
+    -- Prevent screen2 from receiving the old terminal state.
+    command('enew')
+    screen1:expect(screen_empty)
+    screen1:detach()
+
+    local server2 = tmp_dir .. '/nvim.server2'
+    local screen2 = tt.setup_child_nvim({
+      '--listen',
+      server2,
+      '--clean',
+      '--cmd',
+      'lua vim.ui.select = function(items, _, cb) cb(items[1]) end',
+    }, {
+      env = { XDG_RUNTIME_DIR = tmp_dir },
+    })
+    screen2:expect({ any = vim.pesc('[No Name]') })
+
+    tt.feed_data('iThis is server 2.\027')
+    screen2:expect({ any = vim.pesc('This is server 2^.') })
+
+    tt.feed_data(':connect!\013')
     screen2:expect({ any = vim.pesc('This is server 1^.') })
 
     retry(nil, nil, function()
